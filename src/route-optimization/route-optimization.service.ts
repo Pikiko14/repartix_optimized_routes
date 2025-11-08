@@ -21,15 +21,25 @@ export class RouteOptimizationService {
 
   async optimizeRoute(optimizeDto: OptimizeRouteDto): Promise<OptimizedRoute> {
     try {
-      if (optimizeDto.shipping_list_id) {
-        const existingRoute = await this.routeRepository.findByShippingListId(
+      if (optimizeDto.shipping_list_id && optimizeDto.route_type) {
+        const routeType = optimizeDto.route_type;
+        
+        // Verificar si la ruta específica que se quiere crear ya existe
+        const existingRoutePickup = await this.routeRepository.findByShippingListId(
           optimizeDto.shipping_list_id,
           optimizeDto.parent_id,
+          'pickup',
         );
 
-        if (existingRoute) {
+        const existingRouteDelivery = await this.routeRepository.findByShippingListId(
+          optimizeDto.shipping_list_id,
+          optimizeDto.parent_id,
+          'delivery',
+        );
+
+        if (existingRoutePickup && existingRouteDelivery) {
           throw new RpcException({
-            message: 'Shipping list already has an optimized route. Cannot generate a new one.',
+            message: 'Shipping list already has both optimized routes (pickup and delivery). Cannot generate a new one.',
             status: HttpStatus.BAD_REQUEST,
           });
         }
@@ -58,7 +68,7 @@ export class RouteOptimizationService {
         });
       }
 
-      const routePoints = this.buildRoutePoints(orders);
+      const routePoints = this.buildRoutePoints(orders, optimizeDto.route_type);
       const startPoint = optimizeDto.start_location
         ? {
             order_id: 'start',
@@ -95,7 +105,7 @@ export class RouteOptimizationService {
         );
       }
 
-      if (optimizeDto.shipping_list_id) {
+      if (optimizeDto.shipping_list_id && optimizeDto.route_type) {
         await this.routeRepository.create({
           shipping_list_id: optimizeDto.shipping_list_id,
           parent_id: optimizeDto.parent_id,
@@ -105,6 +115,7 @@ export class RouteOptimizationService {
           strategy: optimizedRoute.strategy,
           metadata: optimizedRoute.metadata,
           start_location: optimizeDto.start_location,
+          route_type: optimizeDto.route_type,
         });
       }
 
@@ -171,32 +182,36 @@ export class RouteOptimizationService {
     }
   }
 
-  private buildRoutePoints(orders: any[]): RoutePoint[] {
+  private buildRoutePoints(orders: any[], routeType?: 'pickup' | 'delivery'): RoutePoint[] {
     const points: RoutePoint[] = [];
 
     orders.forEach((order) => {
-      if (order.sender?.address?.coords) {
-        points.push({
-          order_id: order._id || order.id,
-          reference: order.reference,
-          type: 'sender',
-          coords: order.sender.address.coords,
-          address: order.sender.address.address || '',
-          name: order.sender.brand_name,
-          sequence: undefined,
-        });
+      if (routeType === 'pickup' || !routeType) {
+        if (order.sender?.address?.coords) {
+          points.push({
+            order_id: order._id || order.id,
+            reference: order.reference,
+            type: 'sender',
+            coords: order.sender.address.coords,
+            address: order.sender.address.address || '',
+            name: order.sender.brand_name,
+            sequence: undefined,
+          });
+        }
       }
 
-      if (order.client?.coords) {
-        points.push({
-          order_id: order._id || order.id,
-          reference: order.reference,
-          type: 'client',
-          coords: order.client.coords,
-          address: order.client.address || '',
-          name: `${order.client.name} ${order.client.last_name}`.trim(),
-          sequence: undefined,
-        });
+      if (routeType === 'delivery' || !routeType) {
+        if (order.client?.coords) {
+          points.push({
+            order_id: order._id || order.id,
+            reference: order.reference,
+            type: 'client',
+            coords: order.client.coords,
+            address: order.client.address || '',
+            name: `${order.client.name} ${order.client.last_name}`.trim(),
+            sequence: undefined,
+          });
+        }
       }
     });
 
@@ -206,11 +221,13 @@ export class RouteOptimizationService {
   async getOptimizedRoute(
     shippingListId: string,
     parentId: string,
+    routeType?: string,
   ): Promise<OptimizedRoute | null> {
     try {
       const route = await this.routeRepository.findByShippingListId(
         shippingListId,
         parentId,
+        routeType,
       );
 
       if (!route) {
@@ -238,6 +255,111 @@ export class RouteOptimizationService {
     } catch (error) {
       throw new RpcException({
         message: error.message || 'Error getting optimized route',
+        status: HttpStatus.INTERNAL_SERVER_ERROR,
+      });
+    }
+  }
+
+  async listRoutes(
+    parentId: string,
+    page: number = 1,
+    perPage: number = 10,
+    search?: string,
+    routeType?: string,
+    shippingListId?: string,
+  ): Promise<{ data: any[]; totalItems: number }> {
+    try {
+      let shippingListIds: string[] | null = null;
+      
+      if (search) {
+        try {
+          const shippingLists = await firstValueFrom(
+            this.client.send('find-all-shipping-list', {
+              parent_id: parentId,
+              search: search,
+              page: 1,
+              perPage: 100,
+            }),
+          );
+          
+          if (shippingLists?.success && shippingLists?.shippingList?.data) {
+            shippingListIds = shippingLists.shippingList.data.map((sl: any) => sl._id);
+          }
+        } catch (error) {
+          // Si falla la búsqueda por referencia, continuamos con búsqueda normal
+        }
+      }
+
+      const result = await this.routeRepository.findAll(
+        parentId,
+        page,
+        perPage,
+        search,
+        shippingListIds,
+        routeType,
+        shippingListId,
+      );
+      
+      const routesWithShippingList = await Promise.all(
+        result.data.map(async (route) => {
+          try {
+            const shippingList = await firstValueFrom(
+              this.client.send('find-one-shipping-list', {
+                id: route.shipping_list_id,
+                parent_id: route.parent_id,
+              }),
+            );
+
+            return {
+              _id: route._id,
+              shipping_list_id: route.shipping_list_id,
+              shipping_list_reference: shippingList?.shippingList?.reference || route.shipping_list_id,
+              route_type: route.route_type,
+              route: route.route,
+              total_distance: route.total_distance,
+              total_duration: route.total_duration,
+              strategy: route.strategy,
+              metadata: route.metadata,
+              createdAt: route.createdAt,
+              updatedAt: route.updatedAt,
+            };
+          } catch (error) {
+            return {
+              _id: route._id,
+              shipping_list_id: route.shipping_list_id,
+              shipping_list_reference: route.shipping_list_id,
+              route_type: route.route_type,
+              route: route.route,
+              total_distance: route.total_distance,
+              total_duration: route.total_duration,
+              strategy: route.strategy,
+              metadata: route.metadata,
+              createdAt: route.createdAt,
+              updatedAt: route.updatedAt,
+            };
+          }
+        }),
+      );
+
+      return {
+        data: routesWithShippingList,
+        totalItems: result.totalItems,
+      };
+    } catch (error) {
+      throw new RpcException({
+        message: error.message || 'Error listing routes',
+        status: HttpStatus.INTERNAL_SERVER_ERROR,
+      });
+    }
+  }
+
+  async deleteRoute(routeId: string, parentId: string): Promise<boolean> {
+    try {
+      const deleted = await this.routeRepository.deleteById(routeId, parentId);
+      return !!deleted;
+    } catch (error) {
+      throw new RpcException({
+        message: error.message || 'Error deleting route',
         status: HttpStatus.INTERNAL_SERVER_ERROR,
       });
     }

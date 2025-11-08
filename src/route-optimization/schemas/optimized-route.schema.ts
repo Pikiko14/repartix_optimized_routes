@@ -1,7 +1,10 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { Document } from 'mongoose';
 
-export type OptimizedRouteDocument = OptimizedRoute & Document;
+export type OptimizedRouteDocument = OptimizedRoute & Document & {
+  createdAt: Date;
+  updatedAt: Date;
+};
 
 @Schema({ _id: false })
 class Coords {
@@ -68,11 +71,14 @@ export class OptimizedRoute {
     lng: number;
     address?: string;
   };
+
+  @Prop({ required: true })
+  route_type: string;
 }
 
 const OptimizedRouteSchema = SchemaFactory.createForClass(OptimizedRoute);
 
-OptimizedRouteSchema.index({ shipping_list_id: 1, parent_id: 1 }, { unique: true });
+OptimizedRouteSchema.index({ shipping_list_id: 1, parent_id: 1, route_type: 1 });
 
 export { OptimizedRouteSchema };
 
